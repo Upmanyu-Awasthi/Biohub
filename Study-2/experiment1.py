@@ -165,7 +165,7 @@ class UNet3D(nn.Module):
     def __init__(self):
         super().__init__()
         
-        # 1. Hybrid code to increse z axis to `128` and decrese the x and y axis 
+        # 1. Hybrid code to increse z and decrese the x and y axis axis to `128`
         self.stem = nn.Sequential(
             nn.ConvTranspose3d(1, 32, kernel_size=(2,1,1), stride=(2,1,1), padding=0),
             nn.BatchNorm3d(32),
@@ -184,29 +184,43 @@ class UNet3D(nn.Module):
         self.decod1 = ConvBlock(192, 64, 64) # 128 (from decoder) + 64 (from skip l1) = 192
         
         # 4. Final Upsample (Restores output back to full original size)
-        self.final_upsample = nn.ConvTranspose3d(64, 64, kernel_size=2, stride=2)
-        self.finalconv = nn.Conv3d(64, 1, kernel_size=1, padding='same', stride=1)
+        self.final_upsample = nn.ConvTranspose3d(64, 16,kernel_size=(1, 2, 2),stride=(1, 2, 2))
+        self.depth_reduce = nn.Conv3d(16, 16,kernel_size=(2, 1, 1),stride=(2, 1, 1))
+        self.finalconv = nn.Conv3d(16, 1,kernel_size=1, padding='same', stride=1)
         
     def forward(self, X):
-        # Input: (B, 1, 64, 256, 256)
-        
-        # Step 1: Entry Stem Compression
-        stem_out = self.stem(X)          # Shape: (B, 32, 32, 128, 128)
-        
-        # Step 2: Encoder
-        l1 = self.enc1(stem_out)         # Shape: (B, 64, 32, 128, 128) -> Saved for skip connection
-        m1 = self.pool1(l1)              # Shape: (B, 64, 16, 64, 64)
-        l2 = self.enc2(m1)               # Shape: (B, 128, 16, 64, 64) -> Bottleneck feature map
-        
-        # Step 3: Decoder & Skip Connection Integration
-        t1 = self.TransConv1(l2)         # Shape: (B, 128, 32, 128, 128)
-        c1 = torch.cat((l1, t1), dim=1)  # Shape: (B, 192, 32, 128, 128) -> Combined features!
-        d1 = self.decod1(c1)             # Shape: (B, 64, 32, 128, 128)
-        
-        # Step 4: Restore Original Resolution
-        restored = self.final_upsample(d1) # Shape: (B, 64, 64, 256, 256)
-        out = self.finalconv(restored)     # Shape: (B, 1, 64, 256, 256)
-        
+        print("Input:             ", tuple(X.shape))
+    
+        stem_out = self.stem(X)
+        print("Stem:              ", tuple(stem_out.shape))
+    
+        l1 = self.enc1(stem_out)
+        print("Encoder 1 (enc1):   ", tuple(l1.shape))
+    
+        m1 = self.pool1(l1)
+        print("MaxPool (pool1):    ", tuple(m1.shape))
+    
+        l2 = self.enc2(m1)
+        print("Encoder 2 (enc2):   ", tuple(l2.shape))
+    
+        t1 = self.TransConv1(l2)
+        print("TransConv1:         ", tuple(t1.shape))
+    
+        c1 = torch.cat((l1, t1), dim=1)
+        print("Skip concatenation: ", tuple(c1.shape))
+    
+        d1 = self.decod1(c1)
+        print("Decoder (decod1):   ", tuple(d1.shape))
+    
+        restored = self.final_upsample(d1)
+        print("In-plane upsample:  ", tuple(restored.shape))
+    
+        restored = self.depth_reduce(restored)
+        print("Depth reduction:   ", tuple(restored.shape))
+    
+        out = self.finalconv(restored)
+        print("Final output:       ", tuple(out.shape))
+    
         return out
 
 def weighted_loss(pred_vol, target_vol, weight_map):
@@ -218,11 +232,11 @@ class CellDataset(Dataset):
 
     def __init__(
         self,
-        data_dir,
+        DATA_DIR,
         movies,
         fpm=20
     ):
-        self.data_dir = Path(data_dir)
+        self.DATA_DIR = Path(DATA_DIR)
         self.fpm = fpm
         self.samples = []
         self.movies = movies
@@ -237,7 +251,7 @@ class CellDataset(Dataset):
 
         if self.movies is None:
             tqdm.write("Got no files ----------------------------------")
-            zarr_files = sorted(self.data_dir.glob("*.zarr"))
+            zarr_files = sorted(self.DATA_DIR.glob("*.zarr"))
         else:
             zarr_files = sorted(self.movies)
 
@@ -247,7 +261,7 @@ class CellDataset(Dataset):
             ds_name = z_path.stem
 
             # Corresponding GEFF file
-            g_path = self.data_dir / f"{ds_name}.geff"
+            g_path = self.DATA_DIR / f"{ds_name}.geff"
 
             # Require matching GEFF file
             if not g_path.exists():
@@ -296,8 +310,8 @@ class CellDataset(Dataset):
 
         ds_name, t = self.samples[idx]
 
-        z_path = str(self.data_dir / f"{ds_name}.zarr")
-        g_path = str(self.data_dir / f"{ds_name}.geff")
+        z_path = str(self.DATA_DIR / f"{ds_name}.zarr")
+        g_path = str(self.DATA_DIR / f"{ds_name}.geff")
 
         vol = load_volume(z_path, t)
         x = normalize(vol).astype(np.float32)
@@ -396,7 +410,7 @@ def train_with_early_stopping(
     criterion,
     optimizer,
     max_epochs=20,
-    patience=3,
+    patience=4,
     min_delta=1e-4,
     device="cpu" # ^ fallback
 ):
@@ -447,59 +461,34 @@ def train_with_early_stopping(
     return (
         model,
         train_loss_history,
-        val_loss_history,
-        best_weights,
-        best_val_loss
+        val_loss_history
     )
 
-
-def plot_diagnostic_curves(train_sizes, train_errors, val_errors, save_path):
-    """
-    Plots the training and validation errors against the size of the training dataset.
-    This generates the classic bias-variance learning curve.
-    """
-    plt.figure(figsize=(10, 6))
-    
-    plt.plot(train_sizes, train_errors, label='Training Loss', color='blue', marker='o', linestyle='-', linewidth=2, markersize=8)
-    plt.plot(train_sizes, val_errors, label='Validation Loss', color='orange', marker='s', linestyle='-', linewidth=2, markersize=8)
-    
-    # Title and Labels
-    plt.title('Learning Curve: Bias-Variance Analysis', fontsize=14, fontweight='bold')
-    plt.xlabel('Number of Training Movies (Dataset Size)', fontsize=12)
-    plt.ylabel('Mean Weighted Validation/Training Loss', fontsize=12)
-    
-    plt.xticks(train_sizes)
-    
-    # Add grid and legend for readability
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.legend(fontsize=12, loc='upper right')
-    
-    plt.tight_layout()
-
-    plt.savefig(save_path, bbox_inches='tight', dpi=300)
-    plt.close()
-
-    
-
-
+# ! for kaggle  = /kaggle/input/competitions/biohub-cell-tracking-during-development/train
+# ! for kaggle = /kaggle/working
 def main():
     
-    data_dir = Path("/kaggle/input/competitions/biohub-cell-tracking-during-development/train")
-    weights_dir = Path("/kaggle/working/")
-    weights_dir.mkdir(parents=True, exist_ok=True)
+    DATA_DIR = Path(" /kaggle/input/competitions/biohub-cell-tracking-during-development/train") # 
+    OUTPUT_DIR = Path("Study-2/results")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    WEIGHTS_DIR = OUTPUT_DIR / "weights"
+    METRICS_DIR = OUTPUT_DIR / "metrics"
 
-    zarr_files = sorted(list(data_dir.glob("*.zarr")))
+    WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+    METRICS_DIR.mkdir(parents=True, exist_ok=True)
+
+    zarr_files = sorted(list(DATA_DIR.glob("*.zarr")))
     split_idx = int(len(zarr_files) * 0.8)
     train_movies = zarr_files[:split_idx]
     val_movies = zarr_files[split_idx:]
 
-    train_sizes = [20, 40, 80, 120, 160]
+    train_sizes = [20]
     train_errors = []
     val_errors = []
     experiment_history = {}
 
     val_dataset = CellDataset(
-                data_dir=data_dir,
+                DATA_DIR=DATA_DIR,
                 movies=val_movies,
                 fpm=10 # ! can be adjusted
             )
@@ -510,7 +499,7 @@ def main():
         selected_train_movies = train_movies[:n_movies]
 
         train_dataset = CellDataset(
-            data_dir=data_dir,
+            DATA_DIR=DATA_DIR,
             movies=selected_train_movies,
             fpm= 20 # ! can be adjusted
         )
@@ -526,9 +515,9 @@ def main():
             betas=(0.9, 0.999)  # Standard default momentum parameters
         )
 
-        model, train_loss_history, val_loss_history, best_weights, best_val_loss = train_with_early_stopping(
+        model, train_loss_history, val_loss_history = train_with_early_stopping(
             model, train_loader, val_loader, weighted_loss, optimizer,
-            max_epochs=20, patience=3, min_delta=1e-4, device=device
+            max_epochs=25, patience=5, min_delta=1e-4, device=device
         )
 
         mean_train_loss = float(np.mean(train_loss_history))
@@ -536,19 +525,15 @@ def main():
         train_errors.append(mean_train_loss)
         val_errors.append(mean_val_loss)
 
-        model_save_path = weights_dir / f"unet3d_weights_size_{n_movies}.pt"
-        torch.save(model.state_dict(), model_save_path)
+        weight_file = WEIGHTS_DIR / f"unet3d_v2_{n_movies}.pt"
+        torch.save(model.state_dict(), weight_file)
 
         # 2. Store detailed history for JSON export
-        experiment_history[f"size_{n_movies}"] = {
-            "training_movies": n_movies,
-            "mean_train_loss": mean_train_loss,
-            "mean_val_loss": mean_val_loss,
-            "best_val_loss": best_val_loss,
+        experiment_history[n_movies] = {
             "train_loss_per_epoch": train_loss_history,
             "val_loss_per_epoch": val_loss_history,
             "epochs_completed": len(train_loss_history),
-            "weights_file": model_save_path.name
+            "weights_file": weight_file.name
         }
 
         del train_loader
@@ -561,31 +546,11 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-   # Save learning-curve plot
-    plot_path = weights_dir / "bias_variance_curve.png"
-
-    plot_diagnostic_curves(
-        train_sizes=train_sizes,
-        train_errors=train_errors,
-        val_errors=val_errors,
-        save_path=plot_path
-    )
-
-# Store plot information in JSON
-    experiment_history["learning_curve"] = {
-        "train_sizes": train_sizes,
-        "mean_train_losses": train_errors,
-        "mean_val_losses": val_errors,
-        "plot_file": plot_path.name
-    }
-
 # Save complete experiment history
-    output_file = weights_dir / "bias_variance_results.json"
+    result_file = METRICS_DIR / "metric.json"
 
-    with open(output_file, "w") as f:
+    with open(result_file, "w") as f:
         json.dump(experiment_history, f, indent=4)
 
-    print(f"Experiment results saved successfully to {output_file}")
-    print(f"Learning curve saved successfully to {plot_path}")
 if __name__ == "__main__":
     main()

@@ -2,4 +2,5 @@
 /.venv
 /.vscode
 /keys
-/weights
+/Study-1/weights
+/Study-2/results

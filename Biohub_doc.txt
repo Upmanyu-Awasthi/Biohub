@@ -1,0 +1,5 @@
+problems:
+1. the size can be brought down to 128 to avoid memory over flow the decreses in data can be handeled by using augumentations
+ the problems that can ouccer during cropping
+ 1: the might miss the annotated data 
+ 2: 
